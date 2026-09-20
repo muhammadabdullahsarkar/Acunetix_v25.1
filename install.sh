@@ -1,0 +1,801 @@
+#!/usr/bin/env bash
+#
+# Acunetix installation and configuration script
+# ByCh4n | Cyber Security Expert
+#
+# To target a new release, change only the BUILD / VERSION_SHORT
+# variables below; every path is derived from them.
+
+set -Eeuo pipefail
+
+# ----------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------
+readonly VERSION_SHORT="25.1"
+readonly BUILD="250204093"
+readonly ARCHIVE_PASSWORD="Pwn3rzs"
+readonly DOWNLOAD_BASE="https://pwn3rzs.co/scanner_web/acunetix"
+
+# SHA256 of the archive. Leave empty to skip verification (not recommended:
+# the extracted installer is executed as root). Compute it once from a copy
+# you trust with:  sha256sum <archive>
+readonly ARCHIVE_SHA256=""
+
+readonly ARCHIVE_NAME="Acunetix-v${VERSION_SHORT}.${BUILD}-Linux-Pwn3rzs-CyberArsenal.7z"
+readonly INSTALLER_NAME="acunetix_${VERSION_SHORT}.${BUILD}_x64.sh"
+readonly ACUNETIX_HOME="/home/acunetix/.acunetix"
+readonly SCANNER_DIR="${ACUNETIX_HOME}/v_${BUILD}/scanner"
+readonly LICENSE_DIR="${ACUNETIX_HOME}/data/license"
+readonly ACCESS_PORT="3443"
+
+# Rough free-space floor for the install target, in MiB.
+readonly MIN_FREE_MIB="3072"
+
+readonly LOG_FILE="${PWD}/install.log"
+
+# Markers delimiting the block this script owns in /etc/hosts. The whole
+# block is rewritten on every run, which keeps the file idempotent.
+readonly HOSTS_MARK_BEGIN="# >>> acunetix-installer (ByCh4n) >>>"
+readonly HOSTS_MARK_END="# <<< acunetix-installer (ByCh4n) <<<"
+
+# Set to 1 once the run has fully succeeded; controls whether the log is kept.
+INSTALL_OK=0
+
+# Set by -y/--yes: skip interactive confirmation prompts (used by --purge).
+ASSUME_YES=0
+
+# Resolved by detect_7z() - the 7-Zip CLI available on this system.
+SEVENZIP=""
+
+# Resolved by check_platform().
+PKG_MANAGER=""
+DISTRO_NAME="unknown"
+
+# ----------------------------------------------------------------------
+# Colors and logging helpers
+# ----------------------------------------------------------------------
+if [ -t 1 ]; then
+    readonly RED='\033[0;31m'
+    readonly GREEN='\033[0;32m'
+    readonly YELLOW='\033[1;33m'
+    readonly BLUE='\033[0;34m'
+    readonly NC='\033[0m'
+else
+    readonly RED='' GREEN='' YELLOW='' BLUE='' NC=''
+fi
+
+info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
+success() { echo -e "${GREEN}[OK]${NC} $1"; }
+warning() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; exit 1; }
+
+# Remove downloaded temporary files on exit. The log is only removed when the
+# run succeeded - on failure it is exactly what is needed to diagnose things.
+cleanup_tmp() {
+    rm -f "${ARCHIVE_NAME}" "${INSTALLER_NAME}" \
+          license_info.json wa_data.dat wvsc README.txt 2>/dev/null || true
+
+    if [ "$INSTALL_OK" -eq 1 ]; then
+        rm -f "$LOG_FILE" 2>/dev/null || true
+    elif [ -s "$LOG_FILE" ]; then
+        warning "Log kept for troubleshooting: ${LOG_FILE}"
+    fi
+
+    # Never let the trap's own status override the script's exit code.
+    return 0
+}
+
+usage() {
+    cat <<EOF
+Usage: sudo ./install.sh [option]
+
+Options:
+  -h, --help           Show this help message
+  -v, --version        Show the targeted Acunetix version
+  -c, --check          Report what this system looks like, then exit
+  -n, --dry-run        Print the steps that would run, without changing anything
+  -r, --restore-hosts  Remove this script's block from /etc/hosts and exit
+  -u, --uninstall      Undo this script's system changes (service + hosts) and exit
+      --purge          Like --uninstall, and also delete the installed Acunetix files
+  -y, --yes            Assume "yes" for confirmation prompts (for --purge)
+
+With no arguments it runs the full installation flow:
+  platform -> preflight -> deps -> hosts -> download/verify/install -> licensing -> cleanup
+
+Supported: Debian / Ubuntu / Kali (apt) and Arch (pacman), x86_64, systemd.
+EOF
+}
+
+# Free space (MiB) on the filesystem that will hold the given path, walking up
+# to the nearest existing ancestor since /home/acunetix may not exist yet.
+# Runs the pipeline with pipefail disabled and always returns success: in some
+# containers df exits non-zero (e.g. an unreadable mount) even while printing a
+# valid line, which under 'set -Eeuo pipefail' would otherwise abort the caller.
+avail_mib() {
+    local path="$1" out=""
+    while [ ! -d "$path" ] && [ "$path" != "/" ]; do
+        path="$(dirname "$path")"
+    done
+    out="$(set +o pipefail; df -Pm "$path" 2>/dev/null | awk 'NR==2 {print $4}')"
+    printf '%s' "$out"
+    return 0
+}
+
+# Is the access port already taken? Best effort: needs ss or netstat, and is
+# only advisory (returns "unknown" when neither is present).
+port_state() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q . && echo busy || echo free
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -ltn 2>/dev/null | grep -qE "[:.]${port}[[:space:]]" && echo busy || echo free
+    else
+        echo unknown
+    fi
+}
+
+# Resource preflight. The port and df-availability checks are always advisory.
+# Low disk is only fatal when called with "strict" (the real install flow);
+# --check / --dry-run pass the default and merely warn, since they install
+# nothing and often run in containers whose overlay reports little free space.
+check_resources() {
+    local enforce="${1:-warn}"
+    info "Checking resources..."
+
+    local free
+    free="$(avail_mib "$ACUNETIX_HOME")"
+    case "$free" in
+        ''|*[!0-9]*)
+            warning "Could not determine free space (df unavailable?)."
+            ;;
+        *)
+            if [ "$free" -lt "$MIN_FREE_MIB" ]; then
+                if [ "$enforce" = "strict" ]; then
+                    error "Not enough free space for ${ACUNETIX_HOME%/*/*}: ${free} MiB available, ${MIN_FREE_MIB} MiB needed."
+                fi
+                warning "Low free space: ${free} MiB (< ${MIN_FREE_MIB} MiB recommended)."
+            else
+                success "Free space: ${free} MiB (>= ${MIN_FREE_MIB} MiB)."
+            fi
+            ;;
+    esac
+
+    local state
+    state="$(port_state "$ACCESS_PORT")"
+    case "$state" in
+        busy)    warning "Port ${ACCESS_PORT} is already in use - the web UI may not come up." ;;
+        free)    success "Port ${ACCESS_PORT} is free." ;;
+        unknown) warning "Could not check port ${ACCESS_PORT} (ss / netstat not found)." ;;
+    esac
+}
+
+# Reachability of the download host, so a run does not install a pile of
+# dependencies only to fail at the download step. Uses bash's /dev/tcp, so it
+# needs neither curl nor wget (which are installed later). Fatal in the real
+# install flow (strict); advisory in --check / --dry-run.
+check_connectivity() {
+    local enforce="${1:-warn}"
+    info "Checking connectivity to the download host..."
+
+    local host="${DOWNLOAD_BASE#*://}"; host="${host%%/*}"
+    local port=443
+    case "$DOWNLOAD_BASE" in http://*) port=80 ;; esac
+
+    if timeout 10 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
+        success "Download host reachable (${host}:${port})."
+    else
+        if [ "$enforce" = "strict" ]; then
+            error "Cannot reach ${host}:${port}. Check your internet connection before installing."
+        fi
+        warning "Could not reach ${host}:${port} (transient, blocked, or offline)."
+    fi
+}
+
+# Non-destructive preflight: run this first on an untested distribution.
+check_system() {
+    check_platform
+    check_resources
+    check_connectivity
+    if detect_7z; then
+        success "7-Zip CLI found: ${SEVENZIP}"
+    else
+        warning "No 7-Zip CLI yet (7zz / 7za / 7z) - it will be installed."
+    fi
+    echo ""
+    info "Packages that would be installed:"
+    dependency_list | sed 's/^/   /'
+}
+
+# --dry-run: describe the flow without touching the system.
+dry_run() {
+    check_platform
+    check_resources
+    check_connectivity
+    detect_7z || true
+
+    local sevenzip_desc
+    if [ -n "$SEVENZIP" ]; then
+        sevenzip_desc="$SEVENZIP"
+    else
+        sevenzip_desc="7za/7zz (installed with dependencies)"
+    fi
+
+    echo ""
+    info "The following steps WOULD run (nothing is being changed):"
+    cat <<EOF
+   1. install dependencies via ${PKG_MANAGER}
+   2. back up /etc/hosts and (re)write the acunetix block
+   3. download ${ARCHIVE_NAME}
+      from ${DOWNLOAD_BASE}
+   4. $([ -n "$ARCHIVE_SHA256" ] && echo "verify SHA256" || echo "SKIP checksum (ARCHIVE_SHA256 is empty)")
+   5. extract with ${sevenzip_desc} and run ${INSTALLER_NAME}
+   6. place license/patch files and (re)start the acunetix service
+EOF
+    echo ""
+    info "Packages (status on this system):"
+    local entry
+    while read -r entry; do
+        [ -n "$entry" ] || continue
+        # shellcheck disable=SC2086
+        if any_installed $entry; then
+            echo -e "   ${GREEN}installed ${NC} ${entry%% *}"
+        else
+            echo -e "   ${YELLOW}to install${NC} ${entry%% *}"
+        fi
+    done < <(dependency_list)
+    echo ""
+    info "Domains that would be written to /etc/hosts:"
+    hosts_domains | sed 's/^/   /'
+}
+
+# Detect an existing Acunetix install: a registered service unit or its home.
+acunetix_installed() {
+    if command -v systemctl >/dev/null 2>&1 && \
+       systemctl list-unit-files 2>/dev/null | grep -q '^acunetix\.service'; then
+        return 0
+    fi
+    [ -d "$ACUNETIX_HOME" ]
+}
+
+# Ask before a destructive action. Auto-declines without a terminal unless
+# -y/--yes was given, so it never hangs in a pipeline or CI.
+confirm() {
+    local prompt="$1"
+    [ "$ASSUME_YES" -eq 1 ] && return 0
+    if [ ! -t 0 ]; then
+        warning "Refusing a destructive action without a terminal (pass --yes to force)."
+        return 1
+    fi
+    local ans
+    read -r -p "$prompt " ans
+    case "$ans" in yes|YES|y|Y) return 0 ;; *) return 1 ;; esac
+}
+
+# --uninstall: undo the system-level changes this script makes. It stops and
+# disables the service and reverts /etc/hosts; it does not remove the Acunetix
+# payload itself (that was created by the upstream vendor installer) - use
+# --purge for that.
+uninstall() {
+    require_root
+
+    if acunetix_installed; then
+        info "Acunetix appears to be installed."
+    else
+        warning "No Acunetix install detected (service/home dir absent) - reverting anyway."
+    fi
+    info "Reverting changes made by this script..."
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop acunetix 2>/dev/null || true
+        systemctl disable acunetix 2>/dev/null || true
+        success "acunetix service stopped and disabled (if it existed)."
+    fi
+
+    # Clear immutable flags so nothing is left stuck read-only.
+    if command -v chattr >/dev/null 2>&1; then
+        chattr -i "${LICENSE_DIR}/license_info.json" 2>/dev/null || true
+        chattr -i "${LICENSE_DIR}/wa_data.dat" 2>/dev/null || true
+    fi
+
+    restore_hosts
+
+    echo ""
+    info "The Acunetix files under ${ACUNETIX_HOME} are left untouched."
+    info "Run with --purge to remove them as well."
+}
+
+# --purge: everything --uninstall does, plus deleting the installed Acunetix
+# files and service unit. Guarded by a confirmation (skip with --yes).
+purge() {
+    require_root
+    uninstall
+
+    echo ""
+    if ! acunetix_installed && [ ! -d "$ACUNETIX_HOME" ]; then
+        info "Nothing to purge - no Acunetix files found."
+        return 0
+    fi
+
+    warning "PURGE permanently deletes ${ACUNETIX_HOME} and the acunetix service unit."
+    if ! confirm "Type 'yes' to continue:"; then
+        info "Purge cancelled - nothing was deleted."
+        return 0
+    fi
+
+    local unit
+    for unit in /etc/systemd/system/acunetix.service \
+                /lib/systemd/system/acunetix.service \
+                /usr/lib/systemd/system/acunetix.service; do
+        if [ -f "$unit" ]; then
+            rm -f "$unit" && info "Removed ${unit}"
+        fi
+    done
+    command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload 2>/dev/null || true
+
+    # Drop any immutable flags under the tree before removing it.
+    command -v chattr >/dev/null 2>&1 && chattr -R -i "$ACUNETIX_HOME" 2>/dev/null || true
+    rm -rf "${ACUNETIX_HOME:?}"
+    success "Removed ${ACUNETIX_HOME}."
+    info "The 'acunetix' service account, if the vendor installer created one, was left in place."
+}
+
+# ----------------------------------------------------------------------
+# Pre-flight checks
+# ----------------------------------------------------------------------
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        error "This script must be run as root! (sudo ./install.sh)"
+    fi
+}
+
+require_cmd() {
+    local cmd="$1"
+    command -v "$cmd" >/dev/null 2>&1 || error "Required command not found: '${cmd}'."
+}
+
+detect_pkg_manager() {
+    if command -v apt-get >/dev/null 2>&1; then
+        PKG_MANAGER="apt"
+    elif command -v pacman >/dev/null 2>&1; then
+        PKG_MANAGER="pacman"
+    else
+        return 1
+    fi
+    return 0
+}
+
+# The installer ships an x86_64 binary and registers a systemd unit.
+check_platform() {
+    local arch
+    arch="$(uname -m)"
+    if [ "$arch" != "x86_64" ]; then
+        error "Only x86_64 is supported (detected: ${arch})."
+    fi
+
+    if [ -r /etc/os-release ]; then
+        DISTRO_NAME="$(. /etc/os-release && echo "${PRETTY_NAME:-${NAME:-unknown}}")"
+    fi
+
+    detect_pkg_manager || \
+        error "No supported package manager found (looked for apt-get and pacman)."
+
+    info "Detected: ${DISTRO_NAME} - ${arch}, ${PKG_MANAGER}"
+
+    # Acunetix ships a systemd unit, so systemd is required to actually install.
+    # It is only a warning here so the non-destructive --check / --dry-run paths
+    # still work inside minimal containers; the install flow enforces it via
+    # require_cmd systemctl before it does anything.
+    command -v systemctl >/dev/null 2>&1 || \
+        warning "systemd not found ('systemctl') - required for a real install."
+
+    if [ "$PKG_MANAGER" != "apt" ]; then
+        warning "This script is adapted for ${PKG_MANAGER}, but the upstream payload is not."
+        warning "The Pwn3rzs archive is packaged for Debian-based systems and is outside"
+        warning "this project's control. Dependencies, hosts and download will work here;"
+        warning "the upstream installer step may not, and adapting it is up to you."
+    fi
+}
+
+# Debian 13 dropped p7zip in favour of the 7zip package, whose binary is 7zz.
+detect_7z() {
+    local candidate
+    for candidate in 7zz 7za 7z; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            SEVENZIP="$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+banner() {
+    clear
+    cat << "EOF"
+  ___  _  _  ____  _  _  ___  _____  _  _  ____
+ / __)( \/ )( ___)( \( )/ __)(  _  )( \( )( ___)
+( (__  \  /  )__)  )  (( (_-. )(_)(  )  (  )__)
+ \___)  \/  (____)(_)\_)\___/(_____)(_)\_)(____)
+
+      Acunetix Auto Installer & Patcher
+      ByCh4n | Cyber Security Expert
+------------------------------------------------
+EOF
+}
+
+# ----------------------------------------------------------------------
+# 1. Install dependencies
+# ----------------------------------------------------------------------
+# One line per dependency; whitespace-separated names on a line are
+# alternatives and the first one that installs wins. The 7-Zip line comes
+# first because the extraction step depends on it.
+dependency_list() {
+    case "$PKG_MANAGER" in
+        apt)
+            # Debian 13 replaced p7zip-full with 7zip (binaries 7za / 7z, and
+            # 7zz from 7zip-standalone).
+            cat <<'EOF'
+p7zip-full 7zip
+libxcomposite1
+libcups2
+libasound2
+libatk1.0-0
+libgbm1
+libxfixes3
+libcairo2
+libxrandr2
+libxkbcommon0
+libatk-bridge2.0-0
+libxdamage1
+libatspi2.0-0
+wget
+curl
+systemd
+e2fsprogs
+EOF
+            ;;
+        pacman)
+            # Arch splits things differently: mesa carries libgbm, alsa-lib
+            # carries libasound, and at-spi2-core absorbed at-spi2-atk.
+            cat <<'EOF'
+7zip p7zip
+libxcomposite
+libcups
+alsa-lib
+atk
+mesa
+libxfixes
+cairo
+libxrandr
+libxkbcommon
+at-spi2-core
+libxdamage
+wget
+curl
+systemd
+e2fsprogs
+EOF
+            ;;
+    esac
+}
+
+pkg_refresh() {
+    case "$PKG_MANAGER" in
+        apt)
+            apt-get update -qq >>"$LOG_FILE" 2>&1
+            ;;
+        pacman)
+            # A bare 'pacman -Sy' leaves the system in a partial-upgrade state,
+            # which is the classic way to break an Arch install, so refresh and
+            # upgrade in one go.
+            warning "Arch: performing a full 'pacman -Syu' (a partial upgrade would break the system)."
+            pacman -Syu --noconfirm >>"$LOG_FILE" 2>&1
+            ;;
+        *)  return 1 ;;
+    esac
+}
+
+pkg_install() {
+    case "$PKG_MANAGER" in
+        apt)    apt-get install -y "$1" >>"$LOG_FILE" 2>&1 ;;
+        pacman) pacman -S --needed --noconfirm "$1" >>"$LOG_FILE" 2>&1 ;;
+        *)      return 1 ;;
+    esac
+}
+
+# Try each alternative in turn. On apt, every candidate is also retried with a
+# "t64" suffix, the rename Debian 13 / Ubuntu 24.04 applied to several libs.
+install_pkg() {
+    local pkg
+    for pkg in "$@"; do
+        if pkg_install "$pkg"; then
+            return 0
+        fi
+        if [ "$PKG_MANAGER" = "apt" ] && pkg_install "${pkg}t64"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Is a single package already installed? Used by --dry-run to show status.
+pkg_installed() {
+    case "$PKG_MANAGER" in
+        apt)    dpkg -s "$1" >/dev/null 2>&1 ;;
+        pacman) pacman -Q "$1" >/dev/null 2>&1 ;;
+        *)      return 1 ;;
+    esac
+}
+
+# True if any alternative (or its t64 variant on apt) is already installed.
+any_installed() {
+    local pkg
+    for pkg in "$@"; do
+        pkg_installed "$pkg" && return 0
+        [ "$PKG_MANAGER" = "apt" ] && pkg_installed "${pkg}t64" && return 0
+    done
+    return 1
+}
+
+install_dependencies() {
+    info "Updating the system and installing dependencies (${PKG_MANAGER})..."
+    export DEBIAN_FRONTEND=noninteractive
+    : > "$LOG_FILE"
+
+    if ! pkg_refresh; then
+        error "Package database refresh failed. Check your connection / repositories."
+    fi
+
+    local failed=()
+    local entry alternatives
+    while read -r entry; do
+        [ -n "$entry" ] || continue
+        read -r -a alternatives <<< "$entry"
+        if install_pkg "${alternatives[@]}"; then
+            echo -e "   ${GREEN}+${NC} ${alternatives[0]}"
+        else
+            echo -e "   ${RED}-${NC} ${alternatives[0]}"
+            failed+=("${alternatives[0]}")
+        fi
+    done < <(dependency_list)
+
+    if [ "${#failed[@]}" -gt 0 ]; then
+        error "Failed to install: ${failed[*]} (details in ${LOG_FILE})"
+    fi
+    success "All dependencies installed."
+}
+
+# ----------------------------------------------------------------------
+# 2. Update the hosts file
+# ----------------------------------------------------------------------
+# Drop any previously written block and any trailing blank lines, so that the
+# separator added before the block does not accumulate across runs. Rewriting
+# via 'cat >' rather than 'mv' keeps the original inode, ownership and
+# permissions of /etc/hosts.
+strip_hosts_block() {
+    local tmp
+    tmp="$(mktemp)"
+    awk -v begin="$HOSTS_MARK_BEGIN" -v end="$HOSTS_MARK_END" '
+        $0 == begin { skip = 1; next }
+        $0 == end   { skip = 0; next }
+        skip        { next }
+        # Hold blank lines back; they are only emitted once real content
+        # follows, which drops the trailing ones entirely.
+        /^[[:space:]]*$/ { held = held $0 "\n"; next }
+        { printf "%s", held; held = ""; print }
+    ' /etc/hosts > "$tmp"
+
+    cat "$tmp" > /etc/hosts
+    rm -f "$tmp"
+}
+
+hosts_domains() {
+    cat <<'EOF'
+erp.acunetix.com
+discovery-service.invicti.com
+cdn.pendo.io
+bxss.me
+jwtsigner.invicti.com
+sca.acunetix.com
+telemetry.invicti.com
+EOF
+}
+
+update_hosts() {
+    info "Configuring /etc/hosts..."
+
+    if [ ! -f /etc/hosts.original ]; then
+        cp /etc/hosts /etc/hosts.original
+        success "Original hosts file backed up (/etc/hosts.original)"
+    fi
+
+    strip_hosts_block
+
+    local domain ipv4 ipv6
+    {
+        echo ""
+        echo "$HOSTS_MARK_BEGIN"
+        while read -r domain; do
+            [ -n "$domain" ] || continue
+            if [ "$domain" = "telemetry.invicti.com" ]; then
+                ipv4="192.178.49.174"
+                ipv6="2607:f8b0:402a:80a::200e"
+            else
+                ipv4="127.0.0.1"
+                ipv6="::1"
+            fi
+            printf '%s  %s\n' "$ipv4" "$domain"
+            printf '%s  %s\n' "$ipv6" "$domain"
+            echo -e "   ${GREEN}+${NC} ${domain} (${ipv4} / ${ipv6})" >&2
+        done < <(hosts_domains)
+        echo "$HOSTS_MARK_END"
+    } >> /etc/hosts
+
+    success "hosts file updated (block rewritten, IPv4 + IPv6)."
+}
+
+restore_hosts() {
+    require_root
+    if grep -qF "$HOSTS_MARK_BEGIN" /etc/hosts 2>/dev/null; then
+        strip_hosts_block
+        success "Removed this script's block from /etc/hosts."
+    else
+        warning "No block written by this script was found in /etc/hosts."
+    fi
+    if [ -f /etc/hosts.original ]; then
+        info "An untouched backup is still available at /etc/hosts.original"
+    fi
+}
+
+# ----------------------------------------------------------------------
+# 3. Download, verify and install
+# ----------------------------------------------------------------------
+verify_archive() {
+    if [ -z "$ARCHIVE_SHA256" ]; then
+        warning "ARCHIVE_SHA256 is empty - integrity of the archive is NOT verified."
+        warning "Its contents run as root; pin a known-good checksum before trusting it."
+        return 0
+    fi
+
+    require_cmd sha256sum
+    info "Verifying archive checksum..."
+
+    local actual
+    actual="$(sha256sum "$ARCHIVE_NAME" | awk '{print $1}')"
+    if [ "$actual" != "$ARCHIVE_SHA256" ]; then
+        rm -f "$ARCHIVE_NAME"
+        error "Checksum mismatch! expected ${ARCHIVE_SHA256}, got ${actual}. Archive deleted."
+    fi
+    success "Checksum verified."
+}
+
+install_acunetix() {
+    info "Downloading Acunetix (${ARCHIVE_NAME})..."
+    if [ ! -f "$ARCHIVE_NAME" ]; then
+        if ! wget -q --show-progress "${DOWNLOAD_BASE}/${ARCHIVE_NAME}"; then
+            error "Download failed! The link may be broken or there is no internet."
+        fi
+    else
+        warning "Archive already exists, skipping download."
+    fi
+    [ -f "$ARCHIVE_NAME" ] || error "Archive file not found."
+
+    verify_archive
+
+    info "Extracting archive with '${SEVENZIP}'..."
+    if ! "$SEVENZIP" e -y "$ARCHIVE_NAME" -p"$ARCHIVE_PASSWORD" >>"$LOG_FILE" 2>&1; then
+        error "Extraction failed. Wrong password or corrupted archive."
+    fi
+    [ -f "$INSTALLER_NAME" ] || error "Installer file (${INSTALLER_NAME}) not found."
+
+    info "Starting installation... (follow the on-screen prompts)"
+    chmod +x "$INSTALLER_NAME"
+    ./"$INSTALLER_NAME" || error "The Acunetix installer exited with an error."
+}
+
+# ----------------------------------------------------------------------
+# 4. Configure and license
+# ----------------------------------------------------------------------
+configure_acunetix() {
+    info "Starting licensing..."
+    systemctl stop acunetix 2>/dev/null || true
+
+    [ -d "$SCANNER_DIR" ] || error "Scanner directory not found (${SCANNER_DIR}). Installation may be incomplete."
+
+    info "Replacing the scanner binary..."
+    [ -f wvsc ] || error "'wvsc' file not found! Patch files are missing."
+    cp -f wvsc "${SCANNER_DIR}/wvsc" || error "Could not write ${SCANNER_DIR}/wvsc"
+    chown acunetix:acunetix "${SCANNER_DIR}/wvsc" || error "Could not chown ${SCANNER_DIR}/wvsc"
+    chmod +x "${SCANNER_DIR}/wvsc"
+
+    info "Placing license files..."
+    if [ ! -f license_info.json ] || [ ! -f wa_data.dat ]; then
+        error "License files (json/dat) not found!"
+    fi
+
+    mkdir -p "$LICENSE_DIR"
+    chattr -i "${LICENSE_DIR}/license_info.json" 2>/dev/null || true
+    chattr -i "${LICENSE_DIR}/wa_data.dat" 2>/dev/null || true
+    rm -f "${LICENSE_DIR:?}"/* 2>/dev/null || true
+
+    cp license_info.json "${LICENSE_DIR}/" || error "Could not copy license_info.json"
+    cp wa_data.dat "${LICENSE_DIR}/" || error "Could not copy wa_data.dat"
+    chown acunetix:acunetix "${LICENSE_DIR}/license_info.json" "${LICENSE_DIR}/wa_data.dat"
+    chmod 444 "${LICENSE_DIR}/license_info.json" "${LICENSE_DIR}/wa_data.dat"
+
+    # chattr needs a filesystem that supports it (ext*/xfs); don't abort if not.
+    if ! chattr +i "${LICENSE_DIR}/license_info.json" 2>>"$LOG_FILE" || \
+       ! chattr +i "${LICENSE_DIR}/wa_data.dat" 2>>"$LOG_FILE"; then
+        warning "Could not set the immutable flag (unsupported filesystem?)."
+    else
+        success "License files placed and locked."
+    fi
+
+    info "Starting the Acunetix service..."
+    systemctl start acunetix || true
+
+    if systemctl is-active --quiet acunetix; then
+        success "Acunetix service is ACTIVE and running."
+    else
+        error "Failed to start the Acunetix service! Check logs with 'systemctl status acunetix'."
+    fi
+}
+
+# ----------------------------------------------------------------------
+# Main flow
+# ----------------------------------------------------------------------
+main() {
+    # Pick up the -y/--yes modifier anywhere on the line; the first remaining
+    # argument is the command.
+    local cmd="" a
+    for a in "$@"; do
+        case "$a" in
+            -y|--yes) ASSUME_YES=1 ;;
+            *)        [ -z "$cmd" ] && cmd="$a" ;;
+        esac
+    done
+
+    case "$cmd" in
+        -h|--help)          usage; exit 0 ;;
+        -v|--version)       echo "Acunetix ${VERSION_SHORT} (build ${BUILD})"; exit 0 ;;
+        -c|--check)         check_system; exit 0 ;;
+        -n|--dry-run)       dry_run; exit 0 ;;
+        -u|--uninstall)     uninstall; exit 0 ;;
+        --purge)            purge; exit 0 ;;
+        -r|--restore-hosts) restore_hosts; exit 0 ;;
+        "")                 ;;
+        *)                  error "Unknown option: $cmd (use -h for help)" ;;
+    esac
+
+    require_root
+    check_platform
+    check_resources strict
+    check_connectivity strict
+    banner
+
+    trap cleanup_tmp EXIT
+
+    install_dependencies
+
+    # From here on these tools are required.
+    require_cmd wget
+    require_cmd systemctl
+    detect_7z || error "No 7-Zip CLI found (looked for 7zz, 7za, 7z)."
+
+    update_hosts
+    install_acunetix
+    configure_acunetix
+
+    INSTALL_OK=1
+    cleanup_tmp
+    trap - EXIT
+
+    echo ""
+    echo -e "${GREEN}==============================================${NC}"
+    echo -e "${GREEN}   INSTALLATION COMPLETED SUCCESSFULLY!   ${NC}"
+    echo -e "${GREEN}==============================================${NC}"
+    echo -e "Access from a browser: ${YELLOW}https://localhost:${ACCESS_PORT}${NC}"
+    echo -e "or connect using your server IP address."
+    echo ""
+}
+
+main "$@"
